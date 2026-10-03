@@ -141,7 +141,7 @@ def _image_from_snapshot(snapshot: RevisionChapterSnapshot) -> ChapterImage | No
     return ChapterImage(
         id=snapshot.chapter_id,
         project_id=snapshot.project_id,
-        volume_id=getattr(snapshot, "volume_id", "") or "",
+        volume_id=snapshot.volume_id or "",
         title=snapshot.title or "",
         content=snapshot.content or "",
         word_count=snapshot.word_count or 0,
@@ -174,6 +174,7 @@ async def _snapshot_from_image(
         content_blob_id=content_blob_id,
         word_count=image.word_count,
         chapter_order=image.order,
+        volume_id=image.volume_id,
     )
 def _has_changed(before: ChapterImage | None, after: ChapterImage | None) -> bool:
     if before is None or after is None:
@@ -840,6 +841,38 @@ async def record_agent_activity_for_change(
     )
 
 
+async def _record_rollback_chapter_change(
+    session: AsyncSession,
+    *,
+    rollback_revision_id: str,
+    task_id: str,
+    agent_session_id: str,
+    chapter_id: str,
+    before_image: ChapterImage | None,
+    after_image: ChapterImage | None,
+) -> None:
+    if not _has_changed(before_image, after_image):
+        return
+    await commit_repo.create(
+        session,
+        await _commit_from_images(
+            session,
+            rollback_revision_id,
+            chapter_id,
+            before_image,
+            after_image,
+        ),
+    )
+    await record_agent_activity_for_change(
+        session,
+        revision_id=rollback_revision_id,
+        task_id=task_id,
+        agent_session_id=agent_session_id,
+        before=before_image,
+        after=after_image,
+    )
+
+
 async def rollback_revision_for_session(
     session: AsyncSession,
     *,
@@ -954,6 +987,8 @@ async def rollback_revision_for_session(
     affected_volume_ids: set[str] = set()
     deletes = [item for item in restore_by_chapter.values() if not item.exists]
     upserts = [item for item in restore_by_chapter.values() if item.exists]
+    pending_creates: list[tuple[RevisionChapterSnapshot, ChapterImage | None, ChapterImage]] = []
+    pending_updates: list[tuple[RevisionChapterSnapshot, Chapter, ChapterImage | None, ChapterImage]] = []
     for snapshot in [*deletes, *upserts]:
         affected.append(snapshot.chapter_id)
         current = await chapter_repo.get_by_id(session, snapshot.chapter_id)
@@ -966,50 +1001,73 @@ async def rollback_revision_for_session(
         if after_image is None:
             if current is not None:
                 await chapter_repo.delete(session, current)
-        elif current is None:
-            volume_id = after_image.volume_id or await _fallback_volume_id(
-                session, after_image.project_id
-            )
-            await chapter_repo.create(
+            await _record_rollback_chapter_change(
                 session,
-                Chapter(
-                    id=after_image.id,
-                    project_id=after_image.project_id,
-                    volume_id=volume_id,
-                    title=after_image.title,
-                    content=after_image.content,
-                    word_count=after_image.word_count,
-                    order=after_image.order,
-                ),
-            )
-        else:
-            if after_image.volume_id:
-                current.volume_id = after_image.volume_id
-            current.title = after_image.title
-            current.content = after_image.content
-            current.word_count = after_image.word_count
-            current.order = after_image.order
-            current.updated_at = datetime.now(UTC)
-            await chapter_repo.update_chapter(session, current)
-        if _has_changed(before_image, after_image):
-            await commit_repo.create(
-                session,
-                await _commit_from_images(
-                    session,
-                    rollback_revision.id,
-                    snapshot.chapter_id,
-                    before_image,
-                    after_image,
-                ),
-            )
-            await record_agent_activity_for_change(
-                session,
-                revision_id=rollback_revision.id,
+                rollback_revision_id=rollback_revision.id,
                 task_id=target.task_id or "",
                 agent_session_id=agent_session_id,
-                before=before_image,
-                after=after_image,
+                chapter_id=snapshot.chapter_id,
+                before_image=before_image,
+                after_image=after_image,
             )
+        elif current is None:
+            pending_creates.append((snapshot, before_image, after_image))
+        else:
+            pending_updates.append((snapshot, current, before_image, after_image))
+
+    # Park existing chapters at unique temp orders so restoring volume/order
+    # cannot trip UNIQUE(volume_id, order) while another chapter still occupies
+    # the destination slot (the same two-phase pattern as chapter_repo.update_orders).
+    now = datetime.now(UTC)
+    for index, (_snapshot, current, _before_image, _after_image) in enumerate(pending_updates):
+        current.order = -(index + 1)
+        current.updated_at = now
+        await chapter_repo.update_chapter(session, current)
+
+    for snapshot, current, before_image, after_image in pending_updates:
+        if after_image.volume_id:
+            current.volume_id = after_image.volume_id
+        current.title = after_image.title
+        current.content = after_image.content
+        current.word_count = after_image.word_count
+        current.order = after_image.order
+        current.updated_at = datetime.now(UTC)
+        await chapter_repo.update_chapter(session, current)
+        await _record_rollback_chapter_change(
+            session,
+            rollback_revision_id=rollback_revision.id,
+            task_id=target.task_id or "",
+            agent_session_id=agent_session_id,
+            chapter_id=snapshot.chapter_id,
+            before_image=before_image,
+            after_image=after_image,
+        )
+
+    for snapshot, before_image, after_image in pending_creates:
+        volume_id = after_image.volume_id or await _fallback_volume_id(
+            session, after_image.project_id
+        )
+        await chapter_repo.create(
+            session,
+            Chapter(
+                id=after_image.id,
+                project_id=after_image.project_id,
+                volume_id=volume_id,
+                title=after_image.title,
+                content=after_image.content,
+                word_count=after_image.word_count,
+                order=after_image.order,
+            ),
+        )
+        await _record_rollback_chapter_change(
+            session,
+            rollback_revision_id=rollback_revision.id,
+            task_id=target.task_id or "",
+            agent_session_id=agent_session_id,
+            chapter_id=snapshot.chapter_id,
+            before_image=before_image,
+            after_image=after_image,
+        )
 
     for volume_id in affected_volume_ids:
         await refresh_volume_chapter_count(session, volume_id)
