@@ -129,6 +129,10 @@ async def revision_db(monkeypatch):
         create_test_session,
     )
     monkeypatch.setattr(
+        "app.agent_runtime.tools.impls.chapter.move_chapter_to_volume.create_session",
+        create_test_session,
+    )
+    monkeypatch.setattr(
         "app.agent_runtime.tools.impls.note.write_note.create_session",
         create_test_session,
     )
@@ -913,6 +917,195 @@ async def test_rollback_revision_restores_moved_note(revision_db):
 
     assert note is not None
     assert note.category_id == "cat-1"
+
+
+@pytest.mark.asyncio
+async def test_rollback_revision_restores_moved_chapter(revision_db):
+    from app.agent_runtime.revisions import (
+        begin_user_revision,
+        rollback_revision_for_session,
+    )
+    from app.agent_runtime.tools.impls.chapter.move_chapter_to_volume import (
+        MoveChapterToVolumeTool,
+    )
+    from app.storage.repos import chapter_repo, revision_chapter_snapshot_repo
+
+    async with revision_db() as session:
+        session.add(
+            Volume(
+                id="vol-2",
+                project_id="proj-1",
+                title="第二卷",
+                order=2,
+                chapter_count=0,
+            )
+        )
+        await session.commit()
+
+    async with revision_db() as session:
+        user = await message_repo.insert_message(
+            session,
+            session_id="sess-1",
+            task_id="task-1",
+            project_id="proj-1",
+            role="user",
+            status="sent",
+            content="移动章节",
+        )
+        revision = await begin_user_revision(
+            session,
+            project_id="proj-1",
+            task_id="task-1",
+            agent_session_id="sess-1",
+            user_message_id=user.id,
+            user_message_seq=user.seq,
+            message="用户消息: 移动章节",
+            pre_run_checkpoint_id="cp-before",
+            graph_thread_id="sess-1",
+        )
+        await session.commit()
+
+    move_tool = MoveChapterToVolumeTool(
+        _state={
+            "session_id": "sess-1",
+            "task_id": "task-1",
+            "project_id": "proj-1",
+            "current_revision_id": revision.id,
+        }
+    )
+    move_result = json.loads(
+        await move_tool.ainvoke(
+            {
+                "volume_ref": {"type": "order", "value": 1},
+                "chapter_ref": {"type": "order", "value": 1},
+                "target_volume_ref": {"type": "title", "value": "第二卷"},
+            }
+        )
+    )
+    assert move_result["success"] is True
+
+    async with revision_db() as session:
+        moved = await chapter_repo.get_by_id(session, "chap-1")
+        shifted = await chapter_repo.get_by_id(session, "chap-2")
+        snapshots = await revision_chapter_snapshot_repo.list_by_revision(
+            session, revision.id
+        )
+        assert moved is not None
+        assert moved.volume_id == "vol-2"
+        assert shifted is not None
+        assert shifted.volume_id == "vol-1"
+        assert shifted.order == 1
+        assert {item.chapter_id: item.volume_id for item in snapshots}["chap-1"] == "vol-1"
+
+        await rollback_revision_for_session(
+            session,
+            agent_session_id="sess-1",
+            revision_id=revision.id,
+        )
+        await session.commit()
+
+    async with revision_db() as session:
+        restored = await chapter_repo.get_by_id(session, "chap-1")
+        companion = await chapter_repo.get_by_id(session, "chap-2")
+
+    assert restored is not None
+    assert restored.volume_id == "vol-1"
+    assert restored.order == 1
+    assert companion is not None
+    assert companion.volume_id == "vol-1"
+    assert companion.order == 2
+
+
+@pytest.mark.asyncio
+async def test_rollback_revision_restores_deleted_chapter_to_original_volume(revision_db):
+    from app.agent_runtime.revisions import (
+        begin_user_revision,
+        rollback_revision_for_session,
+    )
+    from app.agent_runtime.tools.impls.chapter.delete_chapter import DeleteChapterTool
+    from app.storage.repos import chapter_repo
+
+    async with revision_db() as session:
+        session.add(
+            Volume(
+                id="vol-2",
+                project_id="proj-1",
+                title="第二卷",
+                order=2,
+                chapter_count=1,
+            )
+        )
+        session.add(
+            Chapter(
+                id="chap-3",
+                project_id="proj-1",
+                volume_id="vol-2",
+                title="卷三章",
+                content="第二卷正文",
+                word_count=5,
+                order=1,
+            )
+        )
+        await session.commit()
+
+    async with revision_db() as session:
+        user = await message_repo.insert_message(
+            session,
+            session_id="sess-1",
+            task_id="task-1",
+            project_id="proj-1",
+            role="user",
+            status="sent",
+            content="删除章节",
+        )
+        revision = await begin_user_revision(
+            session,
+            project_id="proj-1",
+            task_id="task-1",
+            agent_session_id="sess-1",
+            user_message_id=user.id,
+            user_message_seq=user.seq,
+            message="用户消息: 删除章节",
+            pre_run_checkpoint_id="cp-before",
+            graph_thread_id="sess-1",
+        )
+        await session.commit()
+
+    delete_tool = DeleteChapterTool(
+        _state={
+            "session_id": "sess-1",
+            "task_id": "task-1",
+            "project_id": "proj-1",
+            "current_revision_id": revision.id,
+        }
+    )
+    delete_result = json.loads(
+        await delete_tool.ainvoke(
+            {
+                "volume_ref": {"type": "title", "value": "第二卷"},
+                "chapter_ref": {"type": "title", "value": "卷三章"},
+            }
+        )
+    )
+    assert delete_result["success"] is True
+
+    async with revision_db() as session:
+        assert await chapter_repo.get_by_id(session, "chap-3") is None
+        await rollback_revision_for_session(
+            session,
+            agent_session_id="sess-1",
+            revision_id=revision.id,
+        )
+        await session.commit()
+
+    async with revision_db() as session:
+        restored = await chapter_repo.get_by_id(session, "chap-3")
+
+    assert restored is not None
+    assert restored.volume_id == "vol-2"
+    assert restored.order == 1
+    assert restored.title == "卷三章"
+    assert restored.content == "第二卷正文"
 
 
 @pytest.mark.asyncio

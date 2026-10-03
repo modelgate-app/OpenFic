@@ -30,5 +30,6 @@ class RevisionChapterSnapshot(SQLModel, table=True):
     )
     word_count: int | None = Field(default=None)
     chapter_order: int | None = Field(default=None)
+    volume_id: str | None = Field(default=None)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC), index=True)
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
