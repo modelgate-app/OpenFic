@@ -1561,22 +1561,30 @@ async def rollback_agent_session(
         agent_session_id=session_id,
         revision_id=request.revision_id,
     )
+    # Checkpoints live in a separate SQLite file from the app DB. Prune them
+    # before committing the chapter restore so a prune failure cannot leave
+    # LangGraph ahead of restored manuscript state (resume would rewrite it).
+    try:
+        if result.restored_checkpoint_id:
+            await delete_checkpoints_after_for_thread(
+                session_id, result.restored_checkpoint_id
+            )
+        for child_thread_id, checkpoint_id in result.child_checkpoint_boundaries:
+            if checkpoint_id:
+                await delete_checkpoints_after_for_thread(child_thread_id, checkpoint_id)
+            else:
+                await delete_checkpoints_for_thread(child_thread_id)
+    except Exception:
+        logger.bind(session_id=session_id).opt(exception=True).error(
+            "Agent graph checkpoint rollback failed; leaving revision uncommitted"
+        )
+        raise
     await session.commit()
 
     replay_buffer = get_agent_event_replay_buffer()
     async with replay_buffer.session_lock(session_id):
         replay_buffer.clear_session_unlocked(session_id)
 
-    if result.restored_checkpoint_id:
-        try:
-            await delete_checkpoints_after_for_thread(
-                session_id, result.restored_checkpoint_id
-            )
-        except Exception:
-            logger.bind(session_id=session_id).opt(exception=True).error(
-                "Agent graph checkpoint rollback failed after revision rollback"
-            )
-            raise
     if result.affected_child_run_ids:
         status_publisher = SubagentRunner(
             session_factory=_make_status_session_factory(session),
@@ -1603,20 +1611,6 @@ async def rollback_agent_session(
             payload,
             room=agent_session_room(session_id),
         )
-    for child_thread_id, checkpoint_id in result.child_checkpoint_boundaries:
-        try:
-            if checkpoint_id:
-                await delete_checkpoints_after_for_thread(child_thread_id, checkpoint_id)
-            else:
-                await delete_checkpoints_for_thread(child_thread_id)
-        except Exception:
-            logger.bind(
-                session_id=session_id,
-                child_thread_id=child_thread_id,
-            ).opt(exception=True).error(
-                "Agent subagent checkpoint rollback failed after revision rollback"
-            )
-            raise
 
     return AgentRollbackResponse(
         success=True,

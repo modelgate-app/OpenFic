@@ -4001,6 +4001,108 @@ class TestAgentAPI:
         await session.refresh(rolled_back_task)
         buffer.clear_all()
 
+    async def test_rollback_does_not_commit_when_checkpoint_prune_fails(
+        self,
+        client: AsyncClient,
+        session,
+    ) -> None:
+        session.add(Project(id="proj-rollback-prune-fail", title="回滚检查点失败项目"))
+        session.add(
+            Volume(
+                id="vol-rollback-prune-fail",
+                project_id="proj-rollback-prune-fail",
+                title="第一卷",
+                order=1,
+                chapter_count=1,
+            )
+        )
+        session.add(
+            Chapter(
+                id="chap-rollback-prune-fail",
+                project_id="proj-rollback-prune-fail",
+                volume_id="vol-rollback-prune-fail",
+                title="第一章",
+                content="旧内容",
+                word_count=3,
+                order=1,
+            )
+        )
+        session.add(
+            Task(
+                id="task-rollback-prune-fail",
+                project_id="proj-rollback-prune-fail",
+                title="Agent Session",
+                mode="agent",
+                agent_session_id="sess-rollback-prune-fail",
+            )
+        )
+        await session.commit()
+
+        user_message = await message_repo.insert_message(
+            session,
+            session_id="sess-rollback-prune-fail",
+            task_id="task-rollback-prune-fail",
+            project_id="proj-rollback-prune-fail",
+            role="user",
+            status="sent",
+            content="改写第一章",
+        )
+        revision = await begin_user_revision(
+            session,
+            project_id="proj-rollback-prune-fail",
+            task_id="task-rollback-prune-fail",
+            agent_session_id="sess-rollback-prune-fail",
+            user_message_id=user_message.id,
+            user_message_seq=user_message.seq,
+            message="用户消息: 改写第一章",
+            pre_run_checkpoint_id="cp-before-prune-fail",
+            graph_thread_id="sess-rollback-prune-fail",
+        )
+        session.add(
+            RevisionChapterSnapshot(
+                revision_id=revision.id,
+                chapter_id="chap-rollback-prune-fail",
+                project_id="proj-rollback-prune-fail",
+                exists=True,
+                title="第一章",
+                content="旧内容",
+                word_count=3,
+                chapter_order=1,
+            )
+        )
+        chapter = await session.get(Chapter, "chap-rollback-prune-fail")
+        assert chapter is not None
+        chapter.content = "新内容"
+        session.add(chapter)
+        await session.commit()
+
+        fake_registry = SimpleNamespace(is_running=AsyncMock(return_value=False))
+        emit_mock = AsyncMock()
+        commit_after_setup = AsyncMock(wraps=session.commit)
+        session.commit = commit_after_setup
+        with (
+            patch(
+                "app.api.routers.agent_runtime.get_agent_run_registry",
+                return_value=fake_registry,
+            ),
+            patch(
+                "app.api.routers.agent_runtime.delete_checkpoints_after_for_thread",
+                AsyncMock(side_effect=RuntimeError("checkpoint sqlite locked")),
+            ),
+            patch(
+                "app.api.routers.agent_runtime.emit",
+                new=emit_mock,
+            ),
+            pytest.raises(RuntimeError, match="checkpoint sqlite locked"),
+        ):
+            await client.post(
+                "/api/v1/agent/sessions/sess-rollback-prune-fail/rollback",
+                json={"revision_id": revision.id},
+            )
+
+        commit_after_setup.assert_not_awaited()
+        emit_mock.assert_not_awaited()
+
     async def test_rollback_created_chapter_emits_global_chapter_refresh_only(
         self,
         client: AsyncClient,
